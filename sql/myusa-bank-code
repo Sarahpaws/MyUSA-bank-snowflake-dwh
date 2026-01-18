@@ -1,0 +1,298 @@
+/* =========================================================
+   PROJECT: USA Bank Financial Analytics
+   DATABASE: BANK_ANALYTICS
+   MODEL: Snowflake Schema
+   ========================================================= */
+
+
+/* =========================================================
+   1. DATABASE SETUP
+   ========================================================= */
+
+CREATE DATABASE IF NOT EXISTS bank_analytics;
+USE bank_analytics;
+
+
+/* =========================================================
+   2. DIMENSION: BANK
+   Stores master information about the bank
+   ========================================================= */
+
+CREATE TABLE dim_bank (
+    bank_key INT AUTO_INCREMENT PRIMARY KEY,
+    bank_name VARCHAR(100),
+    bank_code VARCHAR(20)
+);
+
+-- Insert bank reference data
+INSERT INTO dim_bank (bank_name, bank_code)
+VALUES ('MyUSA Bank', 'MYUSA');
+
+
+/* =========================================================
+   3. STAGING DATA VALIDATION
+   ========================================================= */
+
+-- Validate row count and reporting period
+SELECT 
+    COUNT(*) AS total_rows,
+    MIN(`Date`) AS min_date,
+    MAX(`Date`) AS max_date
+FROM myusabank;
+
+-- Inspect source schema
+DESCRIBE myusabank;
+
+
+/* =========================================================
+   4. DIMENSION: YEAR
+   ========================================================= */
+
+CREATE TABLE dim_year (
+    year_key INT PRIMARY KEY,
+    year_num INT NOT NULL
+);
+
+INSERT INTO dim_year (year_key, year_num)
+SELECT DISTINCT
+    YEAR(`Date`) AS year_key,
+    YEAR(`Date`) AS year_num
+FROM myusabank
+WHERE `Date` IS NOT NULL;
+
+
+/* =========================================================
+   5. DIMENSION: QUARTER
+   Linked to YEAR (Snowflake normalization)
+   ========================================================= */
+
+CREATE TABLE dim_quarter (
+    quarter_key INT PRIMARY KEY,       -- Example: 20221 = 2022 Q1
+    year_key INT NOT NULL,
+    quarter_num TINYINT NOT NULL,
+    CONSTRAINT fk_quarter_year
+        FOREIGN KEY (year_key) REFERENCES dim_year(year_key)
+);
+
+INSERT INTO dim_quarter (quarter_key, year_key, quarter_num)
+SELECT DISTINCT
+    (YEAR(`Date`) * 10 + QUARTER(`Date`)) AS quarter_key,
+    YEAR(`Date`) AS year_key,
+    QUARTER(`Date`) AS quarter_num
+FROM myusabank
+WHERE `Date` IS NOT NULL;
+
+
+/* =========================================================
+   6. DIMENSION: MONTH
+   Linked to QUARTER and YEAR
+   ========================================================= */
+
+CREATE TABLE dim_month (
+    month_key INT PRIMARY KEY,          -- Example: 202201
+    quarter_key INT NOT NULL,
+    year_key INT NOT NULL,
+    month_num TINYINT NOT NULL,
+    month_name VARCHAR(20),
+    CONSTRAINT fk_month_quarter
+        FOREIGN KEY (quarter_key) REFERENCES dim_quarter(quarter_key),
+    CONSTRAINT fk_month_year
+        FOREIGN KEY (year_key) REFERENCES dim_year(year_key)
+);
+
+INSERT INTO dim_month (month_key, quarter_key, year_key, month_num, month_name)
+SELECT DISTINCT
+    (YEAR(`Date`) * 100 + MONTH(`Date`)) AS month_key,
+    (YEAR(`Date`) * 10 + QUARTER(`Date`)) AS quarter_key,
+    YEAR(`Date`) AS year_key,
+    MONTH(`Date`) AS month_num,
+    DATE_FORMAT(`Date`, '%b') AS month_name
+FROM myusabank
+WHERE `Date` IS NOT NULL;
+
+
+/* =========================================================
+   7. DIMENSION: DATE
+   Linked to MONTH
+   ========================================================= */
+
+CREATE TABLE dim_date (
+    date_key INT PRIMARY KEY,           -- YYYYMMDD
+    month_key INT NOT NULL,
+    full_date DATE NOT NULL,
+    day_of_month TINYINT,
+    day_name VARCHAR(10),
+    week_of_year TINYINT,
+    is_weekend BOOLEAN,
+    CONSTRAINT fk_date_month
+        FOREIGN KEY (month_key) REFERENCES dim_month(month_key)
+);
+
+INSERT INTO dim_date (
+    date_key,
+    month_key,
+    full_date,
+    day_of_month,
+    day_name,
+    week_of_year,
+    is_weekend
+)
+SELECT DISTINCT
+    (YEAR(`Date`) * 10000 + MONTH(`Date`) * 100 + DAY(`Date`)) AS date_key,
+    (YEAR(`Date`) * 100 + MONTH(`Date`)) AS month_key,
+    `Date` AS full_date,
+    DAY(`Date`) AS day_of_month,
+    DATE_FORMAT(`Date`, '%a') AS day_name,
+    WEEK(`Date`, 3) AS week_of_year,
+    CASE WHEN DAYOFWEEK(`Date`) IN (1,7) THEN TRUE ELSE FALSE END AS is_weekend
+FROM myusabank
+WHERE `Date` IS NOT NULL;
+
+
+/* =========================================================
+   8. FACT TABLE: DAILY BANK FINANCIALS
+   ========================================================= */
+
+CREATE TABLE fact_bank_daily_finance (
+    date_key INT NOT NULL,
+    bank_key INT NOT NULL,
+
+    interest_income DOUBLE,
+    interest_expense DOUBLE,
+    average_earning_assets DOUBLE,
+    net_income DOUBLE,
+    total_assets DOUBLE,
+    shareholder_equity DOUBLE,
+    operating_expenses DOUBLE,
+    operating_income DOUBLE,
+    market_share DOUBLE,
+    stock_price DOUBLE,
+
+    PRIMARY KEY (date_key, bank_key),
+    CONSTRAINT fk_fact_date FOREIGN KEY (date_key) REFERENCES dim_date(date_key),
+    CONSTRAINT fk_fact_bank FOREIGN KEY (bank_key) REFERENCES dim_bank(bank_key)
+);
+
+
+/* =========================================================
+   9. FACT LOADING
+   - Aggregate duplicate dates
+   - Ensure one row per bank per date
+   ========================================================= */
+
+TRUNCATE TABLE fact_bank_daily_finance;
+
+INSERT INTO fact_bank_daily_finance (
+    date_key,
+    bank_key,
+    interest_income,
+    interest_expense,
+    average_earning_assets,
+    net_income,
+    total_assets,
+    shareholder_equity,
+    operating_expenses,
+    operating_income,
+    market_share,
+    stock_price
+)
+SELECT
+    (YEAR(`Date`) * 10000 + MONTH(`Date`) * 100 + DAY(`Date`)) AS date_key,
+    (SELECT bank_key FROM dim_bank WHERE bank_code = 'MYUSA') AS bank_key,
+
+    AVG(Interest_Income),
+    AVG(Interest_Expense),
+    AVG(Average_Earning_Assets),
+    AVG(Net_Income),
+    AVG(Total_Assets),
+    AVG(Shareholder_Equity),
+    AVG(Operating_Expenses),
+    AVG(Operating_Income),
+    AVG(Market_Share),
+    AVG(Stock_Price)
+FROM myusabank
+WHERE `Date` IS NOT NULL
+GROUP BY `Date`;
+
+
+/* =========================================================
+   10. DATA QUALITY CHECKS
+   ========================================================= */
+
+-- Ensure no duplicate fact rows
+SELECT date_key, COUNT(*)
+FROM fact_bank_daily_finance
+GROUP BY date_key
+HAVING COUNT(*) > 1;
+
+SELECT COUNT(*) AS fact_rows
+FROM fact_bank_daily_finance;
+
+
+/* =========================================================
+   11. ANALYTICAL VIEW: BANK KPIs
+   ========================================================= */
+
+CREATE OR REPLACE VIEW v_bank_daily_kpis AS
+SELECT
+    dd.full_date,
+    dy.year_num,
+    dq.quarter_num,
+    dm.month_num,
+    dm.month_name,
+    b.bank_name,
+
+    f.interest_income,
+    f.interest_expense,
+    (f.interest_income - f.interest_expense) AS net_interest_income,
+
+    (f.interest_income - f.interest_expense) 
+        / NULLIF(f.average_earning_assets, 0) AS nim,
+
+    f.net_income / NULLIF(f.total_assets, 0) AS roa,
+    f.net_income / NULLIF(f.shareholder_equity, 0) AS roe,
+
+    f.operating_expenses / NULLIF(f.operating_income, 0) AS efficiency_ratio,
+    f.shareholder_equity / NULLIF(f.total_assets, 0) AS equity_ratio,
+
+    f.market_share,
+    f.stock_price
+FROM fact_bank_daily_finance f
+JOIN dim_date dd   ON dd.date_key = f.date_key
+JOIN dim_month dm  ON dm.month_key = dd.month_key
+JOIN dim_quarter dq ON dq.quarter_key = dm.quarter_key
+JOIN dim_year dy   ON dy.year_key = dm.year_key
+JOIN dim_bank b    ON b.bank_key = f.bank_key;
+
+
+/* =========================================================
+   12. BUSINESS ANALYSIS QUERIES
+   ========================================================= */
+
+-- Monthly Net Interest Income Trend
+SELECT year_num, month_num, SUM(net_interest_income) AS total_nii
+FROM v_bank_daily_kpis
+GROUP BY year_num, month_num
+ORDER BY year_num, month_num;
+
+-- Efficiency Ratio Trend
+SELECT year_num, month_num, AVG(efficiency_ratio) AS efficiency
+FROM v_bank_daily_kpis
+GROUP BY year_num, month_num;
+
+-- ROA and ROE Trend
+SELECT year_num, month_num, AVG(roa) AS roa, AVG(roe) AS roe
+FROM v_bank_daily_kpis
+GROUP BY year_num, month_num;
+
+-- Market Share Movement
+SELECT year_num, month_num, AVG(market_share) AS market_share
+FROM v_bank_daily_kpis
+GROUP BY year_num, month_num;
+
+-- Top 5 Best Performing Months
+SELECT year_num, month_num, SUM(net_interest_income) AS profit
+FROM v_bank_daily_kpis
+GROUP BY year_num, month_num
+ORDER BY profit DESC
+LIMIT 5;
